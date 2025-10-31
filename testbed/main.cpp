@@ -13,7 +13,6 @@
 #include <imgui.h>
 #include <vulkan/vulkan_core.h>
 
-#include <lodepng.h>
 
 namespace {
 
