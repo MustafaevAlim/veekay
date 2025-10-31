@@ -16,10 +16,13 @@
 
 namespace {
 
+uint32_t model_ubo_size;
+ 	
 constexpr uint32_t max_models = 1024;
 
 struct Vertex {
 	veekay::vec3 position;
+
 	veekay::vec3 normal;
 	veekay::vec2 uv;
 	// NOTE: You can add more attributes
@@ -113,19 +116,42 @@ float toRadians(float degrees) {
 }
 
 veekay::mat4 Transform::matrix() const {
-	// TODO: Scaling and rotation
+	// Scale -> Rotation -> Translation (стандартный порядок)
+    veekay::mat4 scale_mat = veekay::mat4::scaling(scale);
+    
+    // Rotation (аналогично камере: yaw * pitch)
+    veekay::vec3 yaw_axis = {0.0f, 1.0f, 0.0f};
+    veekay::mat4 yaw_rot = veekay::mat4::rotation(yaw_axis, rotation.y);
+    veekay::vec3 pitch_axis = {1.0f, 0.0f, 0.0f};
+    veekay::mat4 pitch_rot = veekay::mat4::rotation(pitch_axis, rotation.x);
+    veekay::mat4 rotation_mat = yaw_rot * pitch_rot;
+    
+    veekay::mat4 translation_mat = veekay::mat4::translation(position);
+    
+    return translation_mat * rotation_mat * scale_mat;
 
-	auto t = veekay::mat4::translation(position);
-
-	return t;
 }
 
 veekay::mat4 Camera::view() const {
-	// TODO: Rotation
+	// Шаг 1: Поворот по Y (yaw) - горизонтальный поворот вокруг мировой Y
+    veekay::vec3 yaw_axis = {0.0f, 1.0f, 0.0f};
+    float yaw_radians = rotation.y;  // Предполагаем, что rotation.y в радианах
+    veekay::mat4 yaw_rotation = veekay::mat4::rotation(yaw_axis, yaw_radians);
 
-	auto t = veekay::mat4::translation(-position);
+    // Шаг 2: Поворот по X (pitch) - вертикальный поворот вокруг локальной X (после yaw)
+    veekay::vec3 pitch_axis = {1.0f, 0.0f, 0.0f};  // Локальная X после yaw
+    float pitch_radians = rotation.x;  // Предполагаем, что rotation.x в радианах
+    veekay::mat4 pitch_rotation = veekay::mat4::rotation(pitch_axis, pitch_radians);
 
-	return t;
+    // Шаг 3: Комбинированный rotation (yaw * pitch, порядок важен для локальных осей)
+    veekay::mat4 full_rotation = yaw_rotation * pitch_rotation;
+
+    // Шаг 4: Translation в отрицательном направлении позиции (look from eye)
+    veekay::vec3 negative_position = -position;  // Оператор - для vec3
+    veekay::mat4 translation = veekay::mat4::translation(negative_position);
+
+    // Шаг 5: View = full_rotation * translation (поворот применяется к перемещению)
+    return full_rotation * translation;
 }
 
 veekay::mat4 Camera::view_projection(float aspect_ratio) const {
@@ -159,9 +185,18 @@ VkShaderModule loadShaderModule(const char* path) {
 	return result;
 }
 
+size_t pad_to_alignment(size_t size, size_t alignment) {
+    return (size + alignment - 1) / alignment * alignment;
+}
+
 void initialize(VkCommandBuffer cmd) {
 	VkDevice& device = veekay::app.vk_device;
 	VkPhysicalDevice& physical_device = veekay::app.vk_physical_device;
+
+	VkPhysicalDeviceProperties props;
+	vkGetPhysicalDeviceProperties(veekay::app.vk_physical_device, &props);
+	uint32_t min_uboa = props.limits.minUniformBufferOffsetAlignment;
+	
 
 	{ // NOTE: Build graphics pipeline
 		vertex_shader_module = loadShaderModule("./shaders/shader.vert.spv");
@@ -426,7 +461,12 @@ void initialize(VkCommandBuffer cmd) {
 			veekay::app.running = false;
 			return;
 		}
+
 	}
+
+
+	size_t model_uniforms_size = sizeof(ModelUniforms);  // 80 байт без padding
+	model_ubo_size = pad_to_alignment(model_uniforms_size, min_uboa); 
 
 	scene_uniforms_buffer = new veekay::graphics::Buffer(
 		sizeof(SceneUniforms),
@@ -434,7 +474,7 @@ void initialize(VkCommandBuffer cmd) {
 		VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
 	model_uniforms_buffer = new veekay::graphics::Buffer(
-		max_models * sizeof(ModelUniforms),
+		max_models * model_ubo_size,
 		nullptr,
 		VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
@@ -648,34 +688,40 @@ void update(double time) {
 		using namespace veekay::input;
 
 		if (mouse::isButtonDown(mouse::Button::left)) {
-			auto move_delta = mouse::cursorDelta();
+			auto move_delta = mouse::cursorDelta();  // vec2 с x/y дельтами
 
-			// TODO: Use mouse_delta to update camera rotation
-			
-			auto view = camera.view();
+            // Обновление rotation (в радианах, sensitivity для плавности)
+            float sensitivity = 0.002f;  // Настройте под вашу мышь
+            camera.rotation.y += move_delta.x * sensitivity;  // Yaw (горизонталь)
+            camera.rotation.x -= move_delta.y * sensitivity;  // Pitch (вертикаль, инверт для естественности)
 
-			// TODO: Calculate right, up and front from view matrix
-			veekay::vec3 right = {1.0f, 0.0f, 0.0f};
-			veekay::vec3 up = {0.0f, -1.0f, 0.0f};
-			veekay::vec3 front = {0.0f, 0.0f, 1.0f};
+            // Вычисляем view для извлечения осей
+            auto view = camera.view();  // Теперь использует полную rotation
 
-			if (keyboard::isKeyDown(keyboard::Key::w))
-				camera.position += front * 0.1f;
+            // Извлечение basis vectors из view (строки как right, up, -forward)
+            veekay::vec3 right = {view[0][0], view[0][1], view[0][2]};   // Строка 0: right vector
+            veekay::vec3 up = {view[1][0], view[1][1], view[1][2]};      // Строка 1: up vector
+            veekay::vec3 front = -veekay::vec3{view[2][0], view[2][1], view[2][2]};  // -Строка 2: forward (Z в Vulkan negative для взгляда)
 
-			if (keyboard::isKeyDown(keyboard::Key::s))
-				camera.position -= front * 0.1f;
+            // Нормализация (если нужно, но view уже ортонормирована)
+            right = veekay::vec3::normalized(right);
+            up = veekay::vec3::normalized(up);
+            front = veekay::vec3::normalized(front);
 
-			if (keyboard::isKeyDown(keyboard::Key::d))
-				camera.position += right * 0.1f;
-
-			if (keyboard::isKeyDown(keyboard::Key::a))
-				camera.position -= right * 0.1f;
-
-			if (keyboard::isKeyDown(keyboard::Key::q))
-				camera.position += up * 0.1f;
-
-			if (keyboard::isKeyDown(keyboard::Key::z))
-				camera.position -= up * 0.1f;
+            // Движение относительно локальных осей (speed с delta time)
+            float speed = 0.5f;  // time как dt, speed в units/sec
+            if (keyboard::isKeyDown(keyboard::Key::w))  // Forward
+                camera.position += front * speed;
+            if (keyboard::isKeyDown(keyboard::Key::s))  // Backward
+                camera.position -= front * speed;
+            if (keyboard::isKeyDown(keyboard::Key::d))  // Strafe right
+                camera.position += right * speed;
+            if (keyboard::isKeyDown(keyboard::Key::a))  // Strafe left
+                camera.position -= right * speed;
+            if (keyboard::isKeyDown(keyboard::Key::q))  // Up
+                camera.position += up * speed;
+            if (keyboard::isKeyDown(keyboard::Key::z))  // Down
+                camera.position -= up * speed;
 		}
 	}
 
@@ -756,7 +802,7 @@ void render(VkCommandBuffer cmd, VkFramebuffer framebuffer) {
 			vkCmdBindIndexBuffer(cmd, current_index_buffer, zero_offset, VK_INDEX_TYPE_UINT32);
 		}
 
-		uint32_t offset = i * sizeof(ModelUniforms);
+		uint32_t offset = static_cast<uint32_t>(i * model_ubo_size);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
 		                    0, 1, &descriptor_set, 1, &offset);
 
