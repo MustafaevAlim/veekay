@@ -700,6 +700,8 @@ void update(double time) {
 	          static_cast<ModelUniforms*>(model_uniforms_buffer->mapped_region));
 }
 
+
+
 void render(VkCommandBuffer cmd, VkFramebuffer framebuffer) {
 	vkResetCommandBuffer(cmd, 0);
 
@@ -769,6 +771,7 @@ void render(VkCommandBuffer cmd, VkFramebuffer framebuffer) {
 } // namespace
 
 int main() {
+	 std::srand(time(nullptr));  
 	return veekay::run({
 		.init = initialize,
 		.shutdown = shutdown,
