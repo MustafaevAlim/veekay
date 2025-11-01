@@ -332,6 +332,137 @@ union mat4 {
 		
 		return result;
 	}
+	 static mat4 inverse(const mat4& m) {
+        mat4 inv;
+
+        inv.elements[0][0] = m.elements[1][1] * m.elements[2][2] * m.elements[3][3] -
+                             m.elements[1][1] * m.elements[2][3] * m.elements[3][2] -
+                             m.elements[2][1] * m.elements[1][2] * m.elements[3][3] +
+                             m.elements[2][1] * m.elements[1][3] * m.elements[3][2] +
+                             m.elements[3][1] * m.elements[1][2] * m.elements[2][3] -
+                             m.elements[3][1] * m.elements[1][3] * m.elements[2][2];
+
+        inv.elements[1][0] = -m.elements[1][0] * m.elements[2][2] * m.elements[3][3] +
+                             m.elements[1][0] * m.elements[2][3] * m.elements[3][2] +
+                             m.elements[2][0] * m.elements[1][2] * m.elements[3][3] -
+                             m.elements[2][0] * m.elements[1][3] * m.elements[3][2] -
+                             m.elements[3][0] * m.elements[1][2] * m.elements[2][3] +
+                             m.elements[3][0] * m.elements[1][3] * m.elements[2][2];
+
+        inv.elements[2][0] = m.elements[1][0] * m.elements[2][1] * m.elements[3][3] -
+                             m.elements[1][0] * m.elements[2][3] * m.elements[3][1] -
+                             m.elements[2][0] * m.elements[1][1] * m.elements[3][3] +
+                             m.elements[2][0] * m.elements[1][3] * m.elements[3][1] +
+                             m.elements[3][0] * m.elements[1][1] * m.elements[2][3] -
+                             m.elements[3][0] * m.elements[1][3] * m.elements[2][1];
+
+        inv.elements[3][0] = -m.elements[1][0] * m.elements[2][1] * m.elements[3][2] +
+                             m.elements[1][0] * m.elements[2][2] * m.elements[3][1] +
+                             m.elements[2][0] * m.elements[1][1] * m.elements[3][2] -
+                             m.elements[2][0] * m.elements[1][2] * m.elements[3][1] -
+                             m.elements[3][0] * m.elements[1][1] * m.elements[2][2] +
+                             m.elements[3][0] * m.elements[1][2] * m.elements[2][1];
+
+        inv.elements[0][1] = -m.elements[0][1] * m.elements[2][2] * m.elements[3][3] +
+                             m.elements[0][1] * m.elements[2][3] * m.elements[3][2] +
+                             m.elements[2][1] * m.elements[0][2] * m.elements[3][3] -
+                             m.elements[2][1] * m.elements[0][3] * m.elements[3][2] -
+                             m.elements[3][1] * m.elements[0][2] * m.elements[2][3] +
+                             m.elements[3][1] * m.elements[0][3] * m.elements[2][2];
+
+        inv.elements[1][1] = m.elements[0][0] * m.elements[2][2] * m.elements[3][3] -
+                             m.elements[0][0] * m.elements[2][3] * m.elements[3][2] -
+                             m.elements[2][0] * m.elements[0][2] * m.elements[3][3] +
+                             m.elements[2][0] * m.elements[0][3] * m.elements[3][2] +
+                             m.elements[3][0] * m.elements[0][2] * m.elements[2][3] -
+                             m.elements[3][0] * m.elements[0][3] * m.elements[2][2];
+
+        inv.elements[2][1] = -m.elements[0][0] * m.elements[2][1] * m.elements[3][3] +
+                             m.elements[0][0] * m.elements[2][3] * m.elements[3][1] +
+                             m.elements[2][0] * m.elements[0][1] * m.elements[3][3] -
+                             m.elements[2][0] * m.elements[0][3] * m.elements[3][1] -
+                             m.elements[3][0] * m.elements[0][1] * m.elements[2][3] +
+                             m.elements[3][0] * m.elements[0][3] * m.elements[2][1];
+
+        inv.elements[3][1] = m.elements[0][0] * m.elements[2][1] * m.elements[3][2] -
+                             m.elements[0][0] * m.elements[2][2] * m.elements[3][1] -
+                             m.elements[2][0] * m.elements[0][1] * m.elements[3][2] +
+                             m.elements[2][0] * m.elements[0][2] * m.elements[3][1] +
+                             m.elements[3][0] * m.elements[0][1] * m.elements[2][2] -
+                             m.elements[3][0] * m.elements[0][2] * m.elements[2][1];
+
+        inv.elements[0][2] = m.elements[0][1] * m.elements[1][2] * m.elements[3][3] -
+                             m.elements[0][1] * m.elements[1][3] * m.elements[3][2] -
+                             m.elements[1][1] * m.elements[0][2] * m.elements[3][3] +
+                             m.elements[1][1] * m.elements[0][3] * m.elements[3][2] +
+                             m.elements[3][1] * m.elements[0][2] * m.elements[1][3] -
+                             m.elements[3][1] * m.elements[0][3] * m.elements[1][2];
+
+        inv.elements[1][2] = -m.elements[0][0] * m.elements[1][2] * m.elements[3][3] +
+                             m.elements[0][0] * m.elements[1][3] * m.elements[3][2] +
+                             m.elements[1][0] * m.elements[0][2] * m.elements[3][3] -
+                             m.elements[1][0] * m.elements[0][3] * m.elements[3][2] -
+                             m.elements[3][0] * m.elements[0][2] * m.elements[1][3] +
+                             m.elements[3][0] * m.elements[0][3] * m.elements[1][2];
+
+        inv.elements[2][2] = m.elements[0][0] * m.elements[1][1] * m.elements[3][3] -
+                             m.elements[0][0] * m.elements[1][3] * m.elements[3][1] -
+                             m.elements[1][0] * m.elements[0][1] * m.elements[3][3] +
+                             m.elements[1][0] * m.elements[0][3] * m.elements[3][1] +
+                             m.elements[3][0] * m.elements[0][1] * m.elements[1][3] -
+                             m.elements[3][0] * m.elements[0][3] * m.elements[1][1];
+
+        inv.elements[3][2] = -m.elements[0][0] * m.elements[1][1] * m.elements[3][2] +
+                             m.elements[0][0] * m.elements[1][2] * m.elements[3][1] +
+                             m.elements[1][0] * m.elements[0][1] * m.elements[3][2] -
+                             m.elements[1][0] * m.elements[0][2] * m.elements[3][1] -
+                             m.elements[3][0] * m.elements[0][1] * m.elements[1][2] +
+                             m.elements[3][0] * m.elements[0][2] * m.elements[1][1];
+
+        inv.elements[0][3] = -m.elements[0][1] * m.elements[1][2] * m.elements[2][3] +
+                             m.elements[0][1] * m.elements[1][3] * m.elements[2][2] +
+                             m.elements[1][1] * m.elements[0][2] * m.elements[2][3] -
+                             m.elements[1][1] * m.elements[0][3] * m.elements[2][2] -
+                             m.elements[2][1] * m.elements[0][2] * m.elements[1][3] +
+                             m.elements[2][1] * m.elements[0][3] * m.elements[1][2];
+
+        inv.elements[1][3] = m.elements[0][0] * m.elements[1][2] * m.elements[2][3] -
+                             m.elements[0][0] * m.elements[1][3] * m.elements[2][2] -
+                             m.elements[1][0] * m.elements[0][2] * m.elements[2][3] +
+                             m.elements[1][0] * m.elements[0][3] * m.elements[2][2] +
+                             m.elements[2][0] * m.elements[0][2] * m.elements[1][3] -
+                             m.elements[2][0] * m.elements[0][3] * m.elements[1][2];
+
+        inv.elements[2][3] = -m.elements[0][0] * m.elements[1][1] * m.elements[2][3] +
+                             m.elements[0][0] * m.elements[1][3] * m.elements[2][1] +
+                             m.elements[1][0] * m.elements[0][1] * m.elements[2][3] -
+                             m.elements[1][0] * m.elements[0][3] * m.elements[2][1] -
+                             m.elements[2][0] * m.elements[0][1] * m.elements[1][3] +
+                             m.elements[2][0] * m.elements[0][3] * m.elements[1][1];
+
+        inv.elements[3][3] = m.elements[0][0] * m.elements[1][1] * m.elements[2][2] -
+                             m.elements[0][0] * m.elements[1][2] * m.elements[2][1] -
+                             m.elements[1][0] * m.elements[0][1] * m.elements[2][2] +
+                             m.elements[1][0] * m.elements[0][2] * m.elements[2][1] +
+                             m.elements[2][0] * m.elements[0][1] * m.elements[1][2] -
+                             m.elements[2][0] * m.elements[0][2] * m.elements[1][1];
+
+        float det = m.elements[0][0] * inv.elements[0][0] + m.elements[0][1] * inv.elements[1][0] + m.elements[0][2] * inv.elements[2][0] + m.elements[0][3] * inv.elements[3][0];
+
+        if (det == 0)
+            return mat4::identity(); // Матрица вырождена
+
+        det = 1.0f / det;
+
+        mat4 result;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                result.elements[i][j] = inv.elements[i][j] * det;
+            }
+        }
+        return result;
+    }
+
 
 	static mat4 translation(vec3 vector) {
 		mat4 result = mat4::identity();
