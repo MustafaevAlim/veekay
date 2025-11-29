@@ -7,12 +7,12 @@ layout (location = 2) in vec2 v_uv;
 layout (location = 0) out vec3 f_position;
 layout (location = 1) out vec3 f_normal;
 layout (location = 2) out vec2 f_uv;
-// [SHADOW] Новая переменная для передачи позиции в пространстве света
-layout (location = 3) out vec4 f_pos_light_space; 
+layout (location = 3) out vec4 f_pos_light_space; // Направленный свет
+// [ENHANCED] Позиции для прожекторов с тенями
+layout (location = 4) out vec4 f_pos_spot_light_space[2];
 
 layout (set = 0, binding = 0, std140) uniform SceneUniforms {
     mat4 view_projection;
-    // [SHADOW] Добавлена матрица вида-проекции света
     mat4 light_view_projection; 
     vec3 camera_pos;
     float _pad0;
@@ -29,14 +29,19 @@ layout (set = 0, binding = 0, std140) uniform SceneUniforms {
 
     uint point_light_count;
     uint spot_light_count;
+    uint shadow_casting_spot_count;
+    float _pad5;
+    
+    // [ENHANCED] Матрицы для прожекторов
+    mat4 spot_light_matrices[2];
 };
 
 layout (set = 0, binding = 1, std140) uniform ModelUniforms {
     mat4 model;
     vec3 albedo_color;
-    float _pad5;
-    vec3 specular_color;
     float _pad6;
+    vec3 specular_color;
+    float _pad7;
     float shininess;
 };
 
@@ -50,6 +55,11 @@ void main() {
     f_normal = normal.xyz;
     f_uv = v_uv;
 
-    // [SHADOW] Расчет координат для карты теней
+    // Расчет координат для shadow maps
     f_pos_light_space = light_view_projection * world_position;
+    
+    // [ENHANCED] Координаты для прожекторов
+    for (uint i = 0; i < 2; ++i) {
+        f_pos_spot_light_space[i] = spot_light_matrices[i] * world_position;
+    }
 }

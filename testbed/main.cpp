@@ -23,8 +23,9 @@ size_t aligned_sizeof;
 constexpr uint32_t max_models = 1024;
 constexpr uint32_t max_point_lights = 8;
 constexpr uint32_t max_spot_lights = 8;
-// [SHADOW] Размер карты теней. Чем больше, тем четче тени, но выше нагрузка.
 constexpr uint32_t shadow_map_size = 2048;
+// [ENHANCED] Количество прожекторов с тенями (для дополнительного задания)
+constexpr uint32_t max_shadow_casting_spots = 2;
 
 struct Material {
     veekay::graphics::Texture* texture = nullptr;
@@ -59,8 +60,7 @@ struct SpotLight {
 
 struct SceneUniforms {
     veekay::mat4 view_projection;
-    // [SHADOW] Добавляем матрицу вида-проекции источника света
-    veekay::mat4 light_view_projection; 
+    veekay::mat4 light_view_projection; // Направленный свет (солнце)
     veekay::vec3 camera_pos;
     float _pad0;
 
@@ -76,12 +76,16 @@ struct SceneUniforms {
 
     uint32_t point_light_count = 0;
     uint32_t spot_light_count = 0;
+    uint32_t shadow_casting_spot_count = 0; // [ENHANCED] Количество прожекторов с тенями
+    float _pad5;
+    
+    // [ENHANCED] Матрицы для прожекторов с тенями
+    veekay::mat4 spot_light_matrices[max_shadow_casting_spots];
 };
 
-// [SHADOW] Структура пуш-констант для передачи модели в шейдер теней
 struct ShadowPushConstants {
     veekay::mat4 model_matrix;
-    veekay::mat4 light_view_proj; // Можно передать и через UBO, но через PC удобно для shadow pass
+    veekay::mat4 light_view_proj;
 };
 
 struct ModelUniforms {
@@ -112,7 +116,6 @@ struct Model {
     veekay::vec3 albedo_color;
     veekay::vec3 specular_color;
     float shininess;
-
     Material* material = nullptr; 
 };
 
@@ -142,18 +145,23 @@ inline namespace {
 
     veekay::vec3 ambient_lights_intensity{0.2f, 0.2f, 0.2f};
 
-    veekay::vec3 sun_light_direction{3.0f, 4.0f, 2.0f}; // Чуть поднял солнце повыше
+    veekay::vec3 sun_light_direction{0.0f, -4.0f, 0.0f};
     veekay::vec3 sun_light_color{1.0f, 1.0f, 1.0f};
     veekay::vec3 ambient_color{1.0f, 1.0f, 1.0f};
     std::vector<PointLight> point_lights;
     std::vector<SpotLight> spot_lights;
+    // [FIX] Храним углы для каждого прожектора (для UI)
+    struct SpotLightAngles {
+        float pitch = -M_PI / 4.0f;  // Угол вниз по умолчанию
+        float yaw = 0.0f;
+    };
+    std::vector<SpotLightAngles> spot_light_angles;
 }
 
 // Vulkan objects
 inline namespace {
     VkShaderModule vertex_shader_module;
     VkShaderModule fragment_shader_module;
-    // [SHADOW] Шейдер для рендера в карту глубины
     VkShaderModule shadow_vertex_shader_module;
 
     VkDescriptorPool descriptor_pool;
@@ -164,18 +172,22 @@ inline namespace {
     VkPipelineLayout pipeline_layout;
     VkPipeline pipeline;
 
-    // [SHADOW] Пайплайн для Shadow Map
     VkPipelineLayout shadow_pipeline_layout;
     VkPipeline shadow_pipeline;
 
-    // [SHADOW] Ресурсы для Shadow Map
+    // Shadow Map для направленного света
     VkImage shadow_image;
     VkDeviceMemory shadow_image_memory;
     VkImageView shadow_image_view;
     VkSampler shadow_sampler;
-    // Дескриптор для текстуры теней (чтобы передать её в основной шейдер)
     VkDescriptorSetLayout descriptor_set_layout_shadow; 
     VkDescriptorSet descriptor_set_shadow;
+
+    // [ENHANCED] Shadow Maps для прожекторов
+    VkImage spot_shadow_images[max_shadow_casting_spots];
+    VkDeviceMemory spot_shadow_image_memories[max_shadow_casting_spots];
+    VkImageView spot_shadow_image_views[max_shadow_casting_spots];
+    VkDescriptorSet descriptor_set_spot_shadows;
 
     veekay::graphics::Buffer* scene_uniforms_buffer;
     veekay::graphics::Buffer* model_uniforms_buffer;
@@ -201,7 +213,7 @@ veekay::mat4 Transform::matrix() const {
 }
 
 veekay::mat4 look_at_matrix(const veekay::vec3& eye, const veekay::vec3& target, const veekay::vec3& world_up) {
-    veekay::vec3 forward = veekay::vec3::normalized(eye - target); // Для камеры OpenGL/Vulkan Z смотрит назад
+    veekay::vec3 forward = veekay::vec3::normalized(eye - target);
     veekay::vec3 right = veekay::vec3::normalized(veekay::vec3::cross(world_up, forward));
     veekay::vec3 up = veekay::vec3::cross(forward, right);
 
@@ -218,18 +230,15 @@ veekay::mat4 look_at_matrix(const veekay::vec3& eye, const veekay::vec3& target,
 }
 
 veekay::mat4 orthographic_matrix(float left, float right, float bottom, float top, float zNear, float zFar) {
-    veekay::mat4 result{}; // Инициализирует нулями
-
-    // Диагональ
+    veekay::mat4 result{};
     result[0][0] = 2.0f / (right - left);
-    result[1][1] = 2.0f / (bottom - top); // Важно: для Vulkan ось Y часто инвертирована, но тут стандартная формула
-    result[2][2] = 1.0f / (zNear - zFar); // Для Vulkan depth range [0, 1]. В OpenGL было бы 2/(near-far)
+    result[1][1] = 2.0f / (bottom - top);
+    result[2][2] = 1.0f / (zNear - zFar);
     result[3][3] = 1.0f;
 
-    // Трансляция (последний столбец)
     result[3][0] = -(right + left) / (right - left);
     result[3][1] = -(bottom + top) / (bottom - top);
-    result[3][2] = zNear / (zNear - zFar); // Для Vulkan [0, 1]
+    result[3][2] = zNear / (zNear - zFar);
 
     return result;
 }
@@ -256,9 +265,16 @@ veekay::mat4 Camera::view() const {
     return look_at_matrix(position, target, up);
 }
 
+veekay::vec3 directionFromAngles(float pitch, float yaw) {
+    return veekay::vec3::normalized({
+        cosf(yaw) * cosf(pitch),
+        -sinf(pitch),
+        sinf(yaw) * cosf(pitch)
+    });
+}
+
 veekay::mat4 Camera::view_projection(float aspect_ratio) const {
     auto projection = veekay::mat4::projection(fov, aspect_ratio, near_plane, far_plane);
-
     return view() * projection;
 }
 
@@ -366,7 +382,6 @@ VkShaderModule loadShaderModule(const char* path) {
     return result;
 }
 
-// [SHADOW] Helper для создания Image
 void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage, VkImage& image, VkDeviceMemory& imageMemory) {
     VkImageCreateInfo imageInfo{};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -391,7 +406,7 @@ void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageF
     VkPhysicalDeviceMemoryProperties memProperties;
     vkGetPhysicalDeviceMemoryProperties(veekay::app.vk_physical_device, &memProperties);
 
-    uint32_t memoryTypeIndex = -1;
+    uint32_t memoryTypeIndex = UINT32_MAX;
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
         if ((memRequirements.memoryTypeBits & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
             memoryTypeIndex = i;
@@ -456,15 +471,23 @@ void initialize(VkCommandBuffer cmd) {
 
     vertex_shader_module = loadShaderModule("./shaders/shader.vert.spv");
     fragment_shader_module = loadShaderModule("./shaders/shader.frag.spv");
-    // [SHADOW] Загружаем shadow shader
     shadow_vertex_shader_module = loadShaderModule("./shaders/shadow.vert.spv");
 
-    // --- Инициализация ресурсов теней ---
-    // 1. Image & View
-    createImage(shadow_map_size, shadow_map_size, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, shadow_image, shadow_image_memory);
+    // Shadow Map для направленного света
+    createImage(shadow_map_size, shadow_map_size, VK_FORMAT_D32_SFLOAT, 
+                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 
+                shadow_image, shadow_image_memory);
     createImageView(shadow_image, VK_FORMAT_D32_SFLOAT, shadow_image_view, VK_IMAGE_ASPECT_DEPTH_BIT);
 
-    // 2. Sampler (Shadow Sampler)
+    // [ENHANCED] Shadow Maps для прожекторов
+    for (uint32_t i = 0; i < max_shadow_casting_spots; ++i) {
+        createImage(shadow_map_size, shadow_map_size, VK_FORMAT_D32_SFLOAT,
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    spot_shadow_images[i], spot_shadow_image_memories[i]);
+        createImageView(spot_shadow_images[i], VK_FORMAT_D32_SFLOAT, spot_shadow_image_views[i], VK_IMAGE_ASPECT_DEPTH_BIT);
+    }
+
+    // Shadow Sampler
     {
         VkSamplerCreateInfo samplerInfo{};
         samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -478,10 +501,9 @@ void initialize(VkCommandBuffer cmd) {
         samplerInfo.maxAnisotropy = 1.0f;
         samplerInfo.minLod = 0.0f;
         samplerInfo.maxLod = 1.0f;
-        samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE; // За пределами карты - освещено (глубина 1.0)
-        // Включаем сравнение! Это ключевой момент для hardware PCF (Percentage Closer Filtering)
+        samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
         samplerInfo.compareEnable = VK_TRUE;
-        samplerInfo.compareOp = VK_COMPARE_OP_LESS; 
+        samplerInfo.compareOp = VK_COMPARE_OP_LESS;
 
         vkCreateSampler(device, &samplerInfo, nullptr, &shadow_sampler);
     }
@@ -501,7 +523,7 @@ void initialize(VkCommandBuffer cmd) {
     input_state_info.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     input_state_info.vertexBindingDescriptionCount = 1;
     input_state_info.pVertexBindingDescriptions = &buffer_binding;
-    input_state_info.vertexAttributeDescriptionCount = (uint32_t)(sizeof(attributes) / sizeof(attributes[0]));
+    input_state_info.vertexAttributeDescriptionCount = 3;
     input_state_info.pVertexAttributeDescriptions = attributes;
 
     VkPipelineInputAssemblyStateCreateInfo assembly_state_info{};
@@ -554,12 +576,12 @@ void initialize(VkCommandBuffer cmd) {
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,           1 },      
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,   1 },      
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,           2 },      
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,   16 + 1 }, // +1 для Shadow Map
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,   16 + 1 + max_shadow_casting_spots },
         };
         VkDescriptorPoolCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        info.maxSets = 1 + 16 + 1;
-        info.poolSizeCount = (uint32_t)(sizeof(pools) / sizeof(pools[0]));
+        info.maxSets = 1 + 16 + 2;
+        info.poolSizeCount = 4;
         info.pPoolSizes = pools;
         vkCreateDescriptorPool(device, &info, nullptr, &descriptor_pool);
     }
@@ -573,12 +595,11 @@ void initialize(VkCommandBuffer cmd) {
         };
         VkDescriptorSetLayoutCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        info.bindingCount = (uint32_t)(sizeof(bindings) / sizeof(bindings[0]));
+        info.bindingCount = 4;
         info.pBindings = bindings;
         vkCreateDescriptorSetLayout(device, &info, nullptr, &descriptor_set_layout_ubo);
     }
 
-    // Set 1: Texture
     {
         VkDescriptorSetLayoutBinding binding{};
         binding.binding = 0;
@@ -593,18 +614,28 @@ void initialize(VkCommandBuffer cmd) {
         vkCreateDescriptorSetLayout(device, &info, nullptr, &descriptor_set_layout_tex);
     }
 
-    // [SHADOW] Set 2: Shadow Map
+    // [ENHANCED] Layout для всех shadow maps (направленный свет + прожекторы)
     {
-        VkDescriptorSetLayoutBinding binding{};
-        binding.binding = 0; // binding 0 в set 2
-        binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        binding.descriptorCount = 1;
-        binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT; // Используется во фрагментном шейдере
+        VkDescriptorSetLayoutBinding bindings[1 + max_shadow_casting_spots];
+        
+        // Binding 0: Shadow map направленного света
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        
+        // Bindings 1-2: Shadow maps прожекторов
+        for (uint32_t i = 0; i < max_shadow_casting_spots; ++i) {
+            bindings[1 + i].binding = 1 + i;
+            bindings[1 + i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            bindings[1 + i].descriptorCount = 1;
+            bindings[1 + i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
 
         VkDescriptorSetLayoutCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        info.bindingCount = 1;
-        info.pBindings = &binding;
+        info.bindingCount = 1 + max_shadow_casting_spots;
+        info.pBindings = bindings;
         vkCreateDescriptorSetLayout(device, &info, nullptr, &descriptor_set_layout_shadow);
     }
 
@@ -612,12 +643,12 @@ void initialize(VkCommandBuffer cmd) {
         VkDescriptorSetLayout layouts[] = { descriptor_set_layout_ubo, descriptor_set_layout_tex, descriptor_set_layout_shadow };
         VkPipelineLayoutCreateInfo layout_info{};
         layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        layout_info.setLayoutCount = 3; // [SHADOW] Теперь 3 сета
+        layout_info.setLayoutCount = 3;
         layout_info.pSetLayouts = layouts;
         vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout);
     }
 
-    // --- Основной Pipeline ---
+    // Основной Pipeline
     {
         VkPipelineShaderStageCreateInfo stages[2]{};
 
@@ -648,8 +679,8 @@ void initialize(VkCommandBuffer cmd) {
         vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
     }
 
-    // --- [SHADOW] Pipeline для теней ---
-     {
+    // Shadow Pipeline
+    {
         VkPipelineShaderStageCreateInfo vertStage{};
         vertStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         vertStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -676,7 +707,6 @@ void initialize(VkCommandBuffer cmd) {
         VkPipelineDepthStencilStateCreateInfo shadowDepthInfo = depth_info;
         shadowDepthInfo.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
-        // [FIX] Убираем лишние атрибуты (только позиция)
         VkVertexInputAttributeDescription shadowAttribute = { 
             .location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = offsetof(Vertex, position) 
         };
@@ -698,12 +728,11 @@ void initialize(VkCommandBuffer cmd) {
         shadowViewportState.scissorCount = 1;
         shadowViewportState.pScissors = &shadowScissor;
 
-        // [DYNAMIC RENDERING] Структура с форматами аттачментов
         VkPipelineRenderingCreateInfoKHR renderingInfo{};
         renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
-        renderingInfo.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT; // Наш формат глубины
+        renderingInfo.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
         renderingInfo.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
-        renderingInfo.colorAttachmentCount = 0; // Цвета нет
+        renderingInfo.colorAttachmentCount = 0;
 
         VkGraphicsPipelineCreateInfo shadowInfo{};
         shadowInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -717,10 +746,8 @@ void initialize(VkCommandBuffer cmd) {
         shadowInfo.pDepthStencilState = &shadowDepthInfo;
         shadowInfo.pColorBlendState = nullptr; 
         shadowInfo.layout = shadow_pipeline_layout;
-        
-        // ВАЖНО:
         shadowInfo.renderPass = VK_NULL_HANDLE; 
-        shadowInfo.pNext = &renderingInfo; // <-- Ссылка на форматы
+        shadowInfo.pNext = &renderingInfo;
 
         vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &shadowInfo, nullptr, &shadow_pipeline);
     }
@@ -730,7 +757,7 @@ void initialize(VkCommandBuffer cmd) {
     point_lights_buffer = new veekay::graphics::Buffer(max_point_lights * sizeof(PointLight), nullptr, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     spot_lights_buffer = new veekay::graphics::Buffer(max_spot_lights * sizeof(SpotLight), nullptr, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-    // Missing texture (клеточка)
+    // Missing texture
     {
         VkSamplerCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -805,7 +832,7 @@ void initialize(VkCommandBuffer cmd) {
         vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
     }
 
-    // [SHADOW] Descriptor set для Shadow Map (set 2)
+    // [ENHANCED] Descriptor set для всех Shadow Maps (set 2)
     {
         VkDescriptorSetLayout layouts[] = { descriptor_set_layout_shadow };
         VkDescriptorSetAllocateInfo allocInfo{};
@@ -816,22 +843,47 @@ void initialize(VkCommandBuffer cmd) {
         
         vkAllocateDescriptorSets(device, &allocInfo, &descriptor_set_shadow);
         
-        VkDescriptorImageInfo imageInfo{};
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-        imageInfo.imageView = shadow_image_view;
-        imageInfo.sampler = shadow_sampler;
+        VkDescriptorImageInfo imageInfos[1 + max_shadow_casting_spots];
+        VkWriteDescriptorSet writes[1 + max_shadow_casting_spots];
         
-        VkWriteDescriptorSet shadowWrite{};
-        shadowWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        shadowWrite.dstSet = descriptor_set_shadow;
-        shadowWrite.dstBinding = 0;
-        shadowWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        shadowWrite.descriptorCount = 1;
-        shadowWrite.pImageInfo = &imageInfo;
+        // Направленный свет
+        imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        imageInfos[0].imageView = shadow_image_view;
+        imageInfos[0].sampler = shadow_sampler;
         
-        vkUpdateDescriptorSets(device, 1, &shadowWrite, 0, nullptr);
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].pNext = nullptr;
+        writes[0].dstSet = descriptor_set_shadow;
+        writes[0].dstBinding = 0;
+        writes[0].dstArrayElement = 0;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].descriptorCount = 1;
+        writes[0].pImageInfo = &imageInfos[0];
+        writes[0].pBufferInfo = nullptr;
+        writes[0].pTexelBufferView = nullptr;
+        
+        // Прожекторы
+        for (uint32_t i = 0; i < max_shadow_casting_spots; ++i) {
+            imageInfos[1 + i].imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+            imageInfos[1 + i].imageView = spot_shadow_image_views[i];
+            imageInfos[1 + i].sampler = shadow_sampler;
+            
+            writes[1 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[1 + i].pNext = nullptr;
+            writes[1 + i].dstSet = descriptor_set_shadow;
+            writes[1 + i].dstBinding = 1 + i;
+            writes[1 + i].dstArrayElement = 0;
+            writes[1 + i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[1 + i].descriptorCount = 1;
+            writes[1 + i].pImageInfo = &imageInfos[1 + i];
+            writes[1 + i].pBufferInfo = nullptr;
+            writes[1 + i].pTexelBufferView = nullptr;
+        }
+        
+        vkUpdateDescriptorSets(device, 1 + max_shadow_casting_spots, writes, 0, nullptr);
     }
 
+    // Plane mesh
     {
         std::vector<Vertex> vertices = {
             {{-5.0f, 0.0f,  5.0f}, {0.0f, -1.0f, 0.0f}, {0.0f, 0.0f}},
@@ -846,6 +898,7 @@ void initialize(VkCommandBuffer cmd) {
         plane_mesh.indices = (uint32_t)idx.size();
     }
 
+    // Cube mesh
     {
         std::vector<Vertex> vertices = {
             // front
@@ -941,6 +994,20 @@ void initialize(VkCommandBuffer cmd) {
         .shininess = 16.0f,
         .material = mat_blue,
     });
+
+    for (uint32_t i = 0; i < max_shadow_casting_spots; ++i) {
+        insertImageBarrier(cmd, spot_shadow_images[i],
+                          0, 0,
+                          VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
+    }
+    
+    // Также инициализируем основную shadow map
+    insertImageBarrier(cmd, shadow_image,
+                      0, 0,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
+
 }
 
 void shutdown() {
@@ -963,10 +1030,18 @@ void shutdown() {
         delete missing_texture;
     }
     
-    // [SHADOW] Cleanup
+    // Shadow cleanup
     vkDestroyImageView(device, shadow_image_view, nullptr);
     vkFreeMemory(device, shadow_image_memory, nullptr);
     vkDestroyImage(device, shadow_image, nullptr);
+    
+    // [ENHANCED] Spot shadows cleanup
+    for (uint32_t i = 0; i < max_shadow_casting_spots; ++i) {
+        vkDestroyImageView(device, spot_shadow_image_views[i], nullptr);
+        vkFreeMemory(device, spot_shadow_image_memories[i], nullptr);
+        vkDestroyImage(device, spot_shadow_images[i], nullptr);
+    }
+    
     vkDestroySampler(device, shadow_sampler, nullptr);
     vkDestroyDescriptorSetLayout(device, descriptor_set_layout_shadow, nullptr);
     vkDestroyPipeline(device, shadow_pipeline, nullptr);
@@ -999,11 +1074,14 @@ void update(double time) {
     ImGui::DragFloat3("Ambient intensity", &ambient_lights_intensity.x);
     ImGui::ColorEdit3("Sun Color", &sun_light_color.x);
     ImGui::DragFloat3("Sun direction", &sun_light_direction.x);
-
+    
+    // [ORIGINAL] Добавление точечных источников света
     if (ImGui::Button("Add Point Light") && point_lights.size() < max_point_lights) {
-        point_lights.push_back(PointLight{ .position = camera.position });
+        point_lights.push_back(PointLight{
+            .position = camera.position
+        });
     }
-
+    
     if (ImGui::CollapsingHeader("Point Lights")) {
         std::vector<int> lights_to_remove;
         for (int i = 0; i < (int)point_lights.size(); ++i) {
@@ -1022,14 +1100,24 @@ void update(double time) {
             point_lights.erase(point_lights.begin() + lights_to_remove[j]);
         }
     }
-
+    
     if (ImGui::Button("Add Spot Light") && spot_lights.size() < max_spot_lights) {
+        // Получаем направление камеры
+        auto view = camera.view();
+        veekay::vec3 forward{view[0][2], view[1][2], view[2][2]};
+        
         spot_lights.push_back(SpotLight{
             .position = camera.position,
-            .radius = 3.0f,
-            .direction = {camera.position.x, -camera.position.y, camera.position.z},
-            .angle = toRadians(180.0f),
+            .radius = 15.0f,
+            .direction = veekay::vec3::normalized(-forward),  // Направление от камеры
+            .angle = toRadians(35.0f),
             .color = {1.0f, 1.0f, 1.0f},
+        });
+        
+        // Добавляем углы для нового прожектора
+        spot_light_angles.push_back(SpotLightAngles{
+            .pitch = camera.rotation.x,
+            .yaw = camera.rotation.y
         });
     }
 
@@ -1039,10 +1127,73 @@ void update(double time) {
             std::string label = "Spot Light " + std::to_string(i);
             if (ImGui::TreeNode(label.c_str())) {
                 ImGui::DragFloat3("Position", &spot_lights[i].position.x, 0.1f);
-                ImGui::DragFloat3("Direction", &spot_lights[i].direction.x, 0.1f);
-                ImGui::DragFloat("Radius", &spot_lights[i].radius, 0.1f, 0.0f);
-                ImGui::DragFloat("angle", &spot_lights[i].angle, 0.01f);
+                
+                // Direction Control
+                ImGui::Text("Direction Control:");
+                float pitch_deg = spot_light_angles[i].pitch * 180.0f / M_PI;
+                float yaw_deg = spot_light_angles[i].yaw * 180.0f / M_PI;
+                
+                bool angles_changed = false;
+                angles_changed |= ImGui::SliderFloat("Pitch (up/down)", &pitch_deg, -180.0f, 180.0f);
+                angles_changed |= ImGui::SliderFloat("Yaw (left/right)", &yaw_deg, -180.0f, 180.0f);
+                
+                if (angles_changed) {
+                    spot_light_angles[i].pitch = pitch_deg * M_PI / 180.0f;
+                    spot_light_angles[i].yaw = yaw_deg * M_PI / 180.0f;
+                    spot_lights[i].direction = directionFromAngles(
+                        spot_light_angles[i].pitch, 
+                        spot_light_angles[i].yaw
+                    );
+                }
+                
+                // [FIX] Также поддерживаем прямое редактирование direction
+                ImGui::Text("Direction (manual):");
+                if (ImGui::DragFloat3("##DirectionManual", &spot_lights[i].direction.x, 0.01f)) {
+                    // Нормализуем и пересчитываем углы
+                    spot_lights[i].direction = veekay::vec3::normalized(spot_lights[i].direction);
+                    
+                    // Обратный расчёт углов из direction
+                    spot_light_angles[i].pitch = asinf(spot_lights[i].direction.y);
+                    spot_light_angles[i].yaw = atan2f(spot_lights[i].direction.z, spot_lights[i].direction.x);
+                }
+                
+                ImGui::Text("Current: (%.2f, %.2f, %.2f)", 
+                        spot_lights[i].direction.x, 
+                        spot_lights[i].direction.y, 
+                        spot_lights[i].direction.z);
+                
+                ImGui::DragFloat("Radius", &spot_lights[i].radius, 0.1f, 0.1f, 100.0f);
+                
+                float angle_deg = spot_lights[i].angle * 180.0f / M_PI;
+                if (ImGui::SliderFloat("Cone Angle", &angle_deg, 5.0f, 90.0f)) {
+                    spot_lights[i].angle = toRadians(angle_deg);
+                }
+                
                 ImGui::ColorEdit3("Color", &spot_lights[i].color.x);
+                
+                if (ImGui::Button("Point Down")) {
+                    spot_light_angles[i].pitch = -M_PI / 2.0f;
+                    spot_light_angles[i].yaw = 0.0f;
+                    spot_lights[i].direction = {0.0f, -1.0f, 0.0f};
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Point Up")) {
+                    spot_light_angles[i].pitch = M_PI / 2.0f;
+                    spot_light_angles[i].yaw = 0.0f;
+                    spot_lights[i].direction = {0.0f, 1.0f, 0.0f};
+                }
+                
+                // [DEBUG] Показываем матрицу тени
+                if (ImGui::TreeNode("Debug Info")) {
+                    ImGui::Text("Pitch: %.2f deg (%.3f rad)", pitch_deg, spot_light_angles[i].pitch);
+                    ImGui::Text("Yaw: %.2f deg (%.3f rad)", yaw_deg, spot_light_angles[i].yaw);
+                    ImGui::Text("Direction: (%.3f, %.3f, %.3f)", 
+                            spot_lights[i].direction.x,
+                            spot_lights[i].direction.y,
+                            spot_lights[i].direction.z);
+                    ImGui::TreePop();
+                }
+                
                 if (ImGui::Button("Remove")) {
                     lights_to_remove.push_back(i);
                 }
@@ -1051,12 +1202,15 @@ void update(double time) {
         }
         for (int j = (int)lights_to_remove.size() - 1; j >= 0; --j) {
             spot_lights.erase(spot_lights.begin() + lights_to_remove[j]);
+            spot_light_angles.erase(spot_light_angles.begin() + lights_to_remove[j]);
         }
     }
     ImGui::End();
 
+    // Управление камерой
     if (!ImGui::IsWindowHovered()) {
         using namespace veekay::input;
+        
         if (mouse::isButtonDown(mouse::Button::right)) {
             auto move_delta = mouse::cursorDelta();
             float sensitivity = 0.002f;
@@ -1064,12 +1218,12 @@ void update(double time) {
             camera.rotation.x -= move_delta.y * sensitivity;
             camera.rotation.x = std::max(-1.57f, std::min(1.57f, camera.rotation.x));
         }
-
+        
         auto view = camera.view();
-        veekay::vec3 right = {view[0][0], view[1][0], view[2][0]};
-        veekay::vec3 up = {view[0][1], view[1][1], view[2][1]};
-        veekay::vec3 forward = {view[0][2], view[1][2], view[2][2]};
-
+        veekay::vec3 right{view[0][0], view[1][0], view[2][0]};
+        veekay::vec3 up{view[0][1], view[1][1], view[2][1]};
+        veekay::vec3 forward{view[0][2], view[1][2], view[2][2]};
+        
         float speed = 0.05f;
         if (keyboard::isKeyDown(keyboard::Key::w)) camera.position += forward * speed;
         if (keyboard::isKeyDown(keyboard::Key::s)) camera.position -= forward * speed;
@@ -1078,31 +1232,40 @@ void update(double time) {
         if (keyboard::isKeyDown(keyboard::Key::q)) camera.position += up * speed;
         if (keyboard::isKeyDown(keyboard::Key::z)) camera.position -= up * speed;
     }
-
-    float aspect_ratio = float(veekay::app.window_width) / float(veekay::app.window_height);
     
+    // Подготовка матриц освещения
+    float aspect_ratio = (float)veekay::app.window_width / (float)veekay::app.window_height;
+    
+    // Матрица для направленного света
     veekay::vec3 light_dir = veekay::vec3::normalized(sun_light_direction);
-    veekay::vec3 light_pos = light_dir * 20.0f; // Сдвигаем позицию, чтобы охватить сцену
+    veekay::vec3 light_pos = -light_dir * 20.0f;
+    veekay::mat4 light_view = look_at_matrix(light_pos, {0, 0, 0}, {0, 1, 0});
     
-    // Матрица вида света
-    veekay::mat4 light_view = look_at_matrix(light_pos, {0,0,0}, {0,1,0});
-    
-    // Параметры ортографической проекции (подберите размер под вашу сцену)
-    float ortho_size =50.0f; 
+    float ortho_size = 50.0f;
     float z_near = 1.0f;
     float z_far = 50.0f;
-
-    // Используем нашу новую функцию вместо mat4::orthographic
     veekay::mat4 light_proj = orthographic_matrix(-ortho_size, ortho_size, -ortho_size, ortho_size, z_near, z_far);
-    
-    // Y-flip для Vulkan (если сцена рендерится вверх ногами в карте теней, уберите это)
-    light_proj[1][1] *= -1; 
-
     veekay::mat4 light_view_projection = light_view * light_proj;
+    
+    // [FIX] Матрицы для прожекторов - ПОСЛЕ обновления direction в UI!
+    veekay::mat4 spot_matrices[max_shadow_casting_spots];
+    uint32_t shadowCastingSpotCount = std::min((uint32_t)spot_lights.size(), max_shadow_casting_spots);
+    
+    for (uint32_t i = 0; i < shadowCastingSpotCount; ++i) {
+        const SpotLight& spot = spot_lights[i];  // Берём УЖЕ ОБНОВЛЁННЫЙ spot
+        veekay::vec3 spotTarget = spot.position - spot.direction;
+        veekay::mat4 spotView = look_at_matrix(spot.position, spotTarget, {0.0f, 1.0f, 0.0f});
+        
+        float fov = spot.angle * 2.2f;
+        veekay::mat4 spotProj = veekay::mat4::projection(fov * 180.0f / M_PI, 1.0f, 0.1f, spot.radius);
+        
+        spot_matrices[i] = spotView * spotProj;
+    }
 
+    // Обновление Scene Uniforms
     SceneUniforms scene_uniforms{
         .view_projection = camera.view_projection(aspect_ratio),
-        .light_view_projection = light_view_projection, // Передаем матрицу в UBO
+        .light_view_projection = light_view_projection,
         .camera_pos = camera.position,
         .ambient_color = ambient_color,
         .ambient_lights_intensity = ambient_lights_intensity,
@@ -1110,20 +1273,28 @@ void update(double time) {
         .sun_light_color = sun_light_color,
         .point_light_count = (uint32_t)point_lights.size(),
         .spot_light_count = (uint32_t)spot_lights.size(),
+        .shadow_casting_spot_count = shadowCastingSpotCount,
     };
-    *(SceneUniforms*)scene_uniforms_buffer->mapped_region = scene_uniforms;
+    
+    for (uint32_t i = 0; i < shadowCastingSpotCount; ++i) {
+        scene_uniforms.spot_light_matrices[i] = spot_matrices[i];
+    }
+    
+    *((SceneUniforms*)scene_uniforms_buffer->mapped_region) = scene_uniforms;
 
     if (!point_lights.empty()) {
-        std::memcpy(point_lights_buffer->mapped_region, point_lights.data(), point_lights.size() * sizeof(PointLight));
+        std::memcpy(point_lights_buffer->mapped_region, point_lights.data(), 
+                    point_lights.size() * sizeof(PointLight));
     }
     if (!spot_lights.empty()) {
-        std::memcpy(spot_lights_buffer->mapped_region, spot_lights.data(), spot_lights.size() * sizeof(SpotLight));
+        std::memcpy(spot_lights_buffer->mapped_region, spot_lights.data(), 
+                    spot_lights.size() * sizeof(SpotLight));
     }
 
     uint8_t* base = static_cast<uint8_t*>(model_uniforms_buffer->mapped_region);
     for (size_t i = 0, n = models.size(); i < n; ++i) {
         const Model& model = models[i];
-        ModelUniforms uniforms{};
+        ModelUniforms uniforms;
         uniforms.model = model.transform.matrix();
         uniforms.albedo_color = model.albedo_color;
         uniforms.specular_color = model.specular_color;
@@ -1136,56 +1307,180 @@ void update(double time) {
 
 void render(VkCommandBuffer cmd, VkFramebuffer framebuffer) {
     vkResetCommandBuffer(cmd, 0);
-
+    
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &begin_info);
 
-    // -------------------------------------------------------------------------
-    // 1. Shadow Pass (Dynamic Rendering)
-    // -------------------------------------------------------------------------
-    
-    // Переводим текстуру глубины в DEPTH_ATTACHMENT_OPTIMAL для записи
-    insertImageBarrier(cmd, shadow_image, 
-        0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
+    // [FIX] Получаем матрицы из scene_uniforms вместо пересоздания!
+    SceneUniforms* scene_data = (SceneUniforms*)scene_uniforms_buffer->mapped_region;
+    veekay::mat4 light_VP = scene_data->light_view_projection;
+    uint32_t shadowCastingSpotCount = scene_data->shadow_casting_spot_count;
 
-    VkRenderingAttachmentInfoKHR depthAttachment{};
-    depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
-    depthAttachment.imageView = shadow_image_view;
-    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    depthAttachment.clearValue.depthStencil = {1.0f, 0};
+    // Dynamic Rendering функции
+    auto vkCmdBeginRenderingKHR = (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(
+        veekay::app.vk_device, "vkCmdBeginRenderingKHR");
+    auto vkCmdEndRenderingKHR = (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(
+        veekay::app.vk_device, "vkCmdEndRenderingKHR");
 
-    VkRenderingInfoKHR renderingInfo{};
-    renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO_KHR;
-    renderingInfo.renderArea = {{0, 0}, {shadow_map_size, shadow_map_size}};
-    renderingInfo.layerCount = 1;
-    renderingInfo.colorAttachmentCount = 0;
-    renderingInfo.pDepthAttachment = &depthAttachment;
+    // =================================================================
+    // SHADOW PASS 1: Направленный свет
+    // =================================================================
+    {
+        insertImageBarrier(cmd, shadow_image,
+                           0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                           VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                           VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
 
-    // Получаем указатели на функции расширения (обычно в 1.2 они нужны явно, в 1.3 уже в ядре)
-    auto vkCmdBeginRenderingKHR = (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(veekay::app.vk_device, "vkCmdBeginRenderingKHR");
-    auto vkCmdEndRenderingKHR = (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(veekay::app.vk_device, "vkCmdEndRenderingKHR");
+        VkRenderingAttachmentInfoKHR depthAttachment{};
+        depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
+        depthAttachment.imageView = shadow_image_view;
+        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        depthAttachment.clearValue.depthStencil = {1.0f, 0};
 
-    if (vkCmdBeginRenderingKHR) {
-        vkCmdBeginRenderingKHR(cmd, &renderingInfo);
-        
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow_pipeline);
+        VkRenderingInfoKHR renderingInfo{};
+        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO_KHR;
+        renderingInfo.renderArea = {{0, 0}, {shadow_map_size, shadow_map_size}};
+        renderingInfo.layerCount = 1;
+        renderingInfo.colorAttachmentCount = 0;
+        renderingInfo.pDepthAttachment = &depthAttachment;
 
-        SceneUniforms* sceneData = (SceneUniforms*)scene_uniforms_buffer->mapped_region;
-        veekay::mat4 lightVP = sceneData->light_view_projection;
+        if (vkCmdBeginRenderingKHR) {
+            vkCmdBeginRenderingKHR(cmd, &renderingInfo);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow_pipeline);
 
-        // Рисуем объекты (упрощенный цикл, можно скопировать полный с биндингом буферов)
-        VkBuffer current_vertex_buffer = VK_NULL_HANDLE;
-        VkBuffer current_index_buffer  = VK_NULL_HANDLE;
+            VkBuffer current_vertex_buffer = VK_NULL_HANDLE;
+            VkBuffer current_index_buffer = VK_NULL_HANDLE;
+            VkDeviceSize zero_offset = 0;
+
+            for (const auto& model : models) {
+                const Mesh& mesh = model.mesh;
+
+                if (current_vertex_buffer != mesh.vertex_buffer->buffer) {
+                    current_vertex_buffer = mesh.vertex_buffer->buffer;
+                    vkCmdBindVertexBuffers(cmd, 0, 1, &current_vertex_buffer, &zero_offset);
+                }
+                if (current_index_buffer != mesh.index_buffer->buffer) {
+                    current_index_buffer = mesh.index_buffer->buffer;
+                    vkCmdBindIndexBuffer(cmd, current_index_buffer, zero_offset, VK_INDEX_TYPE_UINT32);
+                }
+
+                ShadowPushConstants push;
+                push.model_matrix = model.transform.matrix();
+                push.light_view_proj = light_VP;
+
+                vkCmdPushConstants(cmd, shadow_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 
+                                 0, sizeof(ShadowPushConstants), &push);
+                vkCmdDrawIndexed(cmd, mesh.indices, 1, 0, 0, 0);
+            }
+
+            vkCmdEndRenderingKHR(cmd);
+        }
+
+        insertImageBarrier(cmd, shadow_image,
+                           VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                           VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                           VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    }
+
+    // =================================================================
+    // [FIX] SHADOW PASSES для прожекторов - используем матрицы из scene_data!
+    // =================================================================
+    for (uint32_t spotIdx = 0; spotIdx < shadowCastingSpotCount; ++spotIdx) {
+        insertImageBarrier(cmd, spot_shadow_images[spotIdx],
+                           0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                           VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                           VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
+
+        VkRenderingAttachmentInfoKHR depthAttachment{};
+        depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
+        depthAttachment.imageView = spot_shadow_image_views[spotIdx];
+        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        depthAttachment.clearValue.depthStencil = {1.0f, 0};
+
+        VkRenderingInfoKHR renderingInfo{};
+        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO_KHR;
+        renderingInfo.renderArea = {{0, 0}, {shadow_map_size, shadow_map_size}};
+        renderingInfo.layerCount = 1;
+        renderingInfo.colorAttachmentCount = 0;
+        renderingInfo.pDepthAttachment = &depthAttachment;
+
+        if (vkCmdBeginRenderingKHR) {
+            vkCmdBeginRenderingKHR(cmd, &renderingInfo);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow_pipeline);
+
+            VkBuffer current_vertex_buffer = VK_NULL_HANDLE;
+            VkBuffer current_index_buffer = VK_NULL_HANDLE;
+            VkDeviceSize zero_offset = 0;
+
+            for (const auto& model : models) {
+                const Mesh& mesh = model.mesh;
+
+                if (current_vertex_buffer != mesh.vertex_buffer->buffer) {
+                    current_vertex_buffer = mesh.vertex_buffer->buffer;
+                    vkCmdBindVertexBuffers(cmd, 0, 1, &current_vertex_buffer, &zero_offset);
+                }
+                if (current_index_buffer != mesh.index_buffer->buffer) {
+                    current_index_buffer = mesh.index_buffer->buffer;
+                    vkCmdBindIndexBuffer(cmd, current_index_buffer, zero_offset, VK_INDEX_TYPE_UINT32);
+                }
+
+                ShadowPushConstants push;
+                push.model_matrix = model.transform.matrix();
+                // [FIX] Используем матрицу из scene_data вместо локальной!
+                push.light_view_proj = scene_data->spot_light_matrices[spotIdx];
+
+                vkCmdPushConstants(cmd, shadow_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 
+                                 0, sizeof(ShadowPushConstants), &push);
+                vkCmdDrawIndexed(cmd, mesh.indices, 1, 0, 0, 0);
+            }
+
+            vkCmdEndRenderingKHR(cmd);
+        }
+
+        insertImageBarrier(cmd, spot_shadow_images[spotIdx],
+                           VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                           VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                           VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    }
+
+    // =================================================================
+    // MAIN PASS
+    // =================================================================
+    {
+        VkClearValue clear_values[2];
+        clear_values[0].color = {0.1f, 0.1f, 0.1f, 1.0f};
+        clear_values[1].depthStencil = {1.0f, 0};
+
+        VkRenderPassBeginInfo rp_info{};
+        rp_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rp_info.renderPass = veekay::app.vk_render_pass;
+        rp_info.framebuffer = framebuffer;
+        rp_info.renderArea.offset = {0, 0};
+        rp_info.renderArea.extent = {veekay::app.window_width, veekay::app.window_height};
+        rp_info.clearValueCount = 2;
+        rp_info.pClearValues = clear_values;
+
+        vkCmdBeginRenderPass(cmd, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
         VkDeviceSize zero_offset = 0;
-        
-        for (const auto& model : models) {
-             const Mesh& mesh = model.mesh;
+        VkBuffer current_vertex_buffer = VK_NULL_HANDLE;
+        VkBuffer current_index_buffer = VK_NULL_HANDLE;
+
+        for (size_t i = 0, n = models.size(); i < n; ++i) {
+            const Model& model = models[i];
+            const Mesh& mesh = model.mesh;
+
             if (current_vertex_buffer != mesh.vertex_buffer->buffer) {
                 current_vertex_buffer = mesh.vertex_buffer->buffer;
                 vkCmdBindVertexBuffers(cmd, 0, 1, &current_vertex_buffer, &zero_offset);
@@ -1194,104 +1489,30 @@ void render(VkCommandBuffer cmd, VkFramebuffer framebuffer) {
                 current_index_buffer = mesh.index_buffer->buffer;
                 vkCmdBindIndexBuffer(cmd, current_index_buffer, zero_offset, VK_INDEX_TYPE_UINT32);
             }
-            ShadowPushConstants push{};
-            push.model_matrix = model.transform.matrix();
-            push.light_view_proj = lightVP;
-            vkCmdPushConstants(cmd, shadow_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ShadowPushConstants), &push);
+
+            uint32_t offset = (uint32_t)(i * aligned_sizeof);
+
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 
+                                  0, 1, &descriptor_set_ubo, 1, &offset);
+
+            if (model.material && model.material->set != VK_NULL_HANDLE) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 
+                                      1, 1, &model.material->set, 0, nullptr);
+            }
+
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 
+                                  2, 1, &descriptor_set_shadow, 0, nullptr);
+
             vkCmdDrawIndexed(cmd, mesh.indices, 1, 0, 0, 0);
         }
 
-        vkCmdEndRenderingKHR(cmd);
+        vkCmdEndRenderPass(cmd);
     }
 
-    // 2. Барьер: Готовим текстуру для ЧТЕНИЯ в шейдере (Shader Read)
-    insertImageBarrier(cmd, shadow_image, 
-        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
-        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-    // -------------------------------------------------------------------------
-    // 2. Main Pass
-    // -------------------------------------------------------------------------
-
-    VkClearValue clear_values[2];
-    clear_values[0].color = {{0.1f, 0.1f, 0.1f, 1.0f}};
-    clear_values[1].depthStencil = {1.0f, 0};
-
-    VkRenderPassBeginInfo rp_info{};
-    rp_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rp_info.renderPass = veekay::app.vk_render_pass;
-    rp_info.framebuffer = framebuffer;
-    rp_info.renderArea.offset = {0,0};
-    rp_info.renderArea.extent = {veekay::app.window_width, veekay::app.window_height};
-    rp_info.clearValueCount = 2;
-    rp_info.pClearValues = clear_values;
-
-    vkCmdBeginRenderPass(cmd, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    VkDeviceSize zero_offset = 0;
-
-    VkBuffer current_vertex_buffer = VK_NULL_HANDLE;
-    VkBuffer current_index_buffer  = VK_NULL_HANDLE;
-
-    for (size_t i = 0, n = models.size(); i < n; ++i) {
-        const Model& model = models[i];
-        const Mesh& mesh = model.mesh;
-
-        if (current_vertex_buffer != mesh.vertex_buffer->buffer) {
-            current_vertex_buffer = mesh.vertex_buffer->buffer;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &current_vertex_buffer, &zero_offset);
-        }
-
-        if (current_index_buffer != mesh.index_buffer->buffer) {
-            current_index_buffer = mesh.index_buffer->buffer;
-            vkCmdBindIndexBuffer(cmd, current_index_buffer, zero_offset, VK_INDEX_TYPE_UINT32);
-        }
-
-        uint32_t offset = uint32_t(i * aligned_sizeof);
-
-        vkCmdBindDescriptorSets(
-            cmd,
-            VK_PIPELINE_BIND_POINT_GRAPHICS,
-            pipeline_layout,
-            0,                
-            1,                
-            &descriptor_set_ubo,
-            1,               
-            &offset           
-        );
-
-        if (model.material && model.material->set != VK_NULL_HANDLE) {
-            vkCmdBindDescriptorSets(
-                cmd,
-                VK_PIPELINE_BIND_POINT_GRAPHICS,
-                pipeline_layout,
-                1,                
-                1,                
-                &model.material->set,
-                0,
-                nullptr
-            );
-        }
-
-        // [SHADOW] Биндим карту теней (Set 2)
-        vkCmdBindDescriptorSets(
-            cmd,
-            VK_PIPELINE_BIND_POINT_GRAPHICS,
-            pipeline_layout,
-            2,                
-            1,                
-            &descriptor_set_shadow,
-            0,
-            nullptr
-        );
-
-        vkCmdDrawIndexed(cmd, mesh.indices, 1, 0, 0, 0);
-    }
-
-    vkCmdEndRenderPass(cmd);
     vkEndCommandBuffer(cmd);
 }
+
+
 
 } // namespace
 
@@ -1304,3 +1525,4 @@ int main() {
         .render = render,
     });
 }
+
