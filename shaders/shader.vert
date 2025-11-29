@@ -7,9 +7,13 @@ layout (location = 2) in vec2 v_uv;
 layout (location = 0) out vec3 f_position;
 layout (location = 1) out vec3 f_normal;
 layout (location = 2) out vec2 f_uv;
+// [SHADOW] Новая переменная для передачи позиции в пространстве света
+layout (location = 3) out vec4 f_pos_light_space; 
 
 layout (set = 0, binding = 0, std140) uniform SceneUniforms {
     mat4 view_projection;
+    // [SHADOW] Добавлена матрица вида-проекции света
+    mat4 light_view_projection; 
     vec3 camera_pos;
     float _pad0;
 
@@ -37,12 +41,15 @@ layout (set = 0, binding = 1, std140) uniform ModelUniforms {
 };
 
 void main() {
-    vec4 position = model * vec4(v_position, 1.0f);
+    vec4 world_position = model * vec4(v_position, 1.0f);
     vec4 normal = model * vec4(v_normal, 0.0f);
 
-    gl_Position = view_projection * position;
+    gl_Position = view_projection * world_position;
 
-    f_position = position.xyz;
+    f_position = world_position.xyz;
     f_normal = normal.xyz;
     f_uv = v_uv;
+
+    // [SHADOW] Расчет координат для карты теней
+    f_pos_light_space = light_view_projection * world_position;
 }
