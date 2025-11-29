@@ -4,7 +4,7 @@ layout (location = 0) in vec3 f_position;
 layout (location = 1) in vec3 f_normal;
 layout (location = 2) in vec2 f_uv;
 layout (location = 3) in vec4 f_pos_light_space;
-// [ENHANCED] Позиции для прожекторов
+
 layout (location = 4) in vec4 f_pos_spot_light_space[2];
 
 layout (location = 0) out vec4 final_color;
@@ -68,12 +68,10 @@ layout (set = 0, binding = 3, std430) readonly buffer SpotLightsBuffer {
 
 layout (set = 1, binding = 0) uniform sampler2D texSampler;
 
-// [ENHANCED] Shadow maps: направленный свет + прожекторы
 layout (set = 2, binding = 0) uniform sampler2DShadow shadowMap;
 layout (set = 2, binding = 1) uniform sampler2DShadow spotShadowMap0;
 layout (set = 2, binding = 2) uniform sampler2DShadow spotShadowMap1;
 
-// Расчет тени (универсальная функция)
 float calculateShadow(vec4 lightSpacePos, vec3 normal, vec3 lightDir, sampler2DShadow shadowSampler) {
     vec3 projCoords = lightSpacePos.xyz / lightSpacePos.w;
     projCoords.xy = projCoords.xy * 0.5 + 0.5;
@@ -98,7 +96,6 @@ void main() {
     
     vec3 color = ambient_light_intensity * albedoWithTexture;
 
-    // --- Sun Light (Направленный свет) ---
     vec3 light_dir = normalize(-sun_light_direction);
     float sun_shade = max(0.0, dot(light_dir, normal));
     
@@ -112,7 +109,6 @@ void main() {
         color += (sun_diffuse + sun_specular) * shadowFactor;
     }
 
-    // --- Point Lights ---
     for (uint i = 0; i < point_light_count; ++i) {
         PointLight light = point_lights[i];
         vec3 ldir = normalize(light.position - f_position);
@@ -128,8 +124,6 @@ void main() {
         color += light_falloff * (light_diffuse + light_spec);
     }
 
-    // --- [ENHANCED] Spot Lights с тенями ---
-    // В shader.frag, в цикле Spot Lights:
     for (uint i = 0; i < spot_light_count; ++i) {
         SpotLight light = spot_lights[i];
         vec3 ldir = normalize(light.position - f_position);
@@ -156,7 +150,6 @@ void main() {
             float spec_angle = max(0.0, dot(normal, half_vec));
             vec3 light_spec = specular_color * light.color * pow(spec_angle, shininess);
 
-            // [ENHANCED] Применение теней от прожекторов
             float spotShadow = 1.0;
             if (i < shadow_casting_spot_count) {
                 if (i == 0) {

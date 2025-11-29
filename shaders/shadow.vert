@@ -1,7 +1,6 @@
 #version 450
 
 layout(location = 0) in vec3 inPosition;
-// Нормали и UV здесь не нужны
 
 layout(push_constant) uniform Constants {
     mat4 model;
